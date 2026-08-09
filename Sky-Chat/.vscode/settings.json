@@ -1,0 +1,9 @@
+{
+    "commentTranslate.hover.enabled": true,
+    "commentTranslate.targetLanguage": "zh-CN",
+    "search.useGlobalIgnoreFiles": true,
+    "search.useParentIgnoreFiles": true,
+    "terminal.integrated.env.windows": {
+        "Path": "${env:APPDATA}\\npm;${env:Path}"
+    }
+}

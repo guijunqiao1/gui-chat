@@ -1,0 +1,60 @@
+# Gui Chat Docker Compose 配置
+# 包含 PostgreSQL 数据库和 Next.js 应用
+#
+# 使用方式:
+#   1. 确保 .env 文件存在并配置了 AUTH_SECRET、SILICONFLOW_API_KEY 等
+#   2. 运行 pnpm docker:up 或 docker compose up -d
+#   3. 访问 http://localhost:3000
+
+services:
+  # PostgreSQL 数据库
+  postgres:
+    image: postgres:16-alpine
+    container_name: gui-chat-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: guichat
+      POSTGRES_PASSWORD: password123
+      POSTGRES_DB: guichat
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U guichat']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Next.js 应用
+  # 启动时会自动执行 prisma migrate deploy 创建/更新数据库表结构
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: gui-chat-app
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      # Docker 内部网络通过服务名 postgres 连接数据库（覆盖 .env 中的 localhost 地址）
+      DATABASE_URL: "postgresql://guichat:password123@postgres:5432/guichat"
+      NODE_ENV: production
+    # 从 .env 加载 AUTH_SECRET、JWT_SECRET、SILICONFLOW_API_KEY、OAuth 凭据等
+    env_file:
+      - .env
+    volumes:
+      - ./generated:/app/public/generated
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -q -O /dev/null http://localhost:3000/api/health || exit 1']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  postgres_data:
+    driver: local
