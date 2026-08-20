@@ -19,10 +19,44 @@ model User {
   apiKey        String?
   createdAt     DateTime       @default(now())
   conversations Conversation[]
+  knowledgeDocuments KnowledgeDocument[]
+  memories      ConversationMemory[]
   accounts      Account[]
   sessions      Session[]
   
   @@index([email])
+}
+
+/// A user-owned source document in the private knowledge base.
+model KnowledgeDocument {
+  id        String           @id @default(cuid())
+  userId    String
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name      String
+  source    String?
+  metadata  Json?
+  chunks    KnowledgeChunk[]
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+
+  @@index([userId, updatedAt(sort: Desc)])
+}
+
+/// Text chunks are embedded with the model configured by RAG_EMBEDDING_MODEL.
+/// Prisma does not yet expose pgvector operations, so `embedding` is queried by
+/// the knowledge-search tool through parameterised raw SQL.
+model KnowledgeChunk {
+  id         String            @id @default(cuid())
+  documentId String
+  document   KnowledgeDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  content    String            @db.Text
+  chunkIndex Int
+  embedding  Unsupported("vector")
+  metadata   Json?
+  createdAt  DateTime          @default(now())
+
+  @@unique([documentId, chunkIndex])
+  @@index([documentId])
 }
 
 model Account {
@@ -98,6 +132,7 @@ model Conversation {
   userId       String
   user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   messages     Message[]
+  memories     ConversationMemory[]
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
   shareToken   String?   @unique
@@ -141,4 +176,27 @@ model MonitorEvent {
   @@index([type])
   @@index([timestamp])
   @@index([type, timestamp])
+}
+
+/// 对话记忆（RAG 场景 B：跨会话记忆检索）
+/// 用户和 AI 的历史消息切片后向量化存储，memory_search 工具跨所有
+/// 会话检索最相关的历史记忆片段。
+model ConversationMemory {
+  id             String       @id @default(cuid())
+  userId         String
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  messageId      String?
+  role           String   // user | assistant
+  chunkIndex     Int
+  content        String   @db.Text
+  embedding      Json?
+  tokenCount     Int      @default(0)
+  importance     Float    @default(0.5)
+  createdAt      DateTime @default(now())
+
+  @@index([userId])
+  @@index([conversationId])
+  @@index([userId, createdAt(sort: Desc)])
 }

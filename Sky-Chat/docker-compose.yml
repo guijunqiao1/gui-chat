@@ -9,7 +9,7 @@
 services:
   # PostgreSQL 数据库
   postgres:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:pg16
     container_name: gui-chat-postgres
     restart: unless-stopped
     environment:
@@ -17,7 +17,7 @@ services:
       POSTGRES_PASSWORD: password123
       POSTGRES_DB: guichat
     ports:
-      - "5433:5432"
+      - '5433:5432'
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -35,10 +35,10 @@ services:
     container_name: gui-chat-app
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - '3000:3000'
     environment:
       # Docker 内部网络通过服务名 postgres 连接数据库（覆盖 .env 中的 localhost 地址）
-      DATABASE_URL: "postgresql://guichat:password123@postgres:5432/guichat"
+      DATABASE_URL: 'postgresql://guichat:password123@postgres:5432/guichat'
       NODE_ENV: production
     # 从 .env 加载 AUTH_SECRET、JWT_SECRET、SILICONFLOW_API_KEY、OAuth 凭据等
     env_file:
@@ -49,7 +49,11 @@ services:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ['CMD-SHELL', 'wget -q -O /dev/null http://localhost:3000/api/health || exit 1']
+      test:
+        [
+          'CMD-SHELL',
+          'wget -q -O /dev/null http://localhost:3000/api/health || exit 1',
+        ]
       interval: 30s
       timeout: 10s
       retries: 3

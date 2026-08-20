@@ -1,12 +1,50 @@
 /**
  * 消息持久化模块
- * 
+ *
  * 负责将消息内容保存到数据库
+ * RAG 场景 B：AI 回答落库后自动写入长期记忆索引（fire-and-forget）
  */
 
 import { MessageRepository } from '@/server/repositories/message.repository'
 import { ConversationRepository } from '@/server/repositories/conversation.repository'
 import type { ToolCall } from '@/server/services/tools'
+import { indexMemory } from '@/server/services/memory/indexer'
+
+/** createMessages 返回 */
+export interface CreateMessagesResult {
+  userMessageId: string
+  aiMessageId: string
+}
+
+/**
+ * 创建一轮对话的两条消息：用户消息 + 空的 AI 消息（流式回填）
+ * @returns { userMessageId, aiMessageId }
+ */
+export async function createMessages(
+  conversationId: string,
+  userContent: string,
+  userMessageIdIn: string | undefined,
+  aiMessageIdIn: string | undefined,
+  attachments?: Array<{ name: string; content: string; type: string; size: number }>
+): Promise<CreateMessagesResult> {
+  const userMessage = await MessageRepository.create({
+    id: userMessageIdIn || undefined,
+    conversationId,
+    role: 'user',
+    content: userContent,
+    attachments:
+      attachments && attachments.length
+        ? (JSON.parse(JSON.stringify(attachments)) as unknown as import('@prisma/client').Prisma.InputJsonValue)
+        : undefined,
+  })
+  const aiMessage = await MessageRepository.create({
+    id: aiMessageIdIn || undefined,
+    conversationId,
+    role: 'assistant',
+    content: '',
+  })
+  return { userMessageId: userMessage.id, aiMessageId: aiMessage.id }
+}
 
 /** 工具结果数据 */
 export interface ToolResultData {
@@ -25,12 +63,15 @@ export interface MessageContent {
 
 /**
  * 保存消息内容到数据库
+ * 副作用：AI 回答落库后异步写入长期记忆（RAG 场景 B）
  */
 export async function persistMessage(
   messageId: string,
   conversationId: string,
   userId: string,
-  content: MessageContent
+  content: MessageContent,
+  /** 可选：向量化用的 API Key */
+  embeddingApiKey?: string
 ): Promise<void> {
   try {
     await MessageRepository.update(messageId, {
@@ -45,6 +86,20 @@ export async function persistMessage(
     })
 
     await ConversationRepository.touch(conversationId, userId)
+
+    // RAG 场景 B：AI 回答写入长期记忆（fire-and-forget）
+    if (content.answerContent && content.answerContent.trim().length >= 6) {
+      void indexMemory({
+        userId,
+        conversationId,
+        messageId,
+        role: 'assistant',
+        content: content.answerContent,
+        apiKey: embeddingApiKey,
+      }).catch((err) => {
+        console.error('[MessagePersister] AI 回答记忆索引失败：', err.message)
+      })
+    }
   } catch (error) {
     console.error('[MessagePersister] Failed to save message:', error)
   }
@@ -106,7 +161,7 @@ export function processImageResults(
     const imageUrl = resultData.result?.imageUrl as string | undefined
     const width = resultData.result?.width as number | undefined
     const height = resultData.result?.height as number | undefined
-    
+
     if (resultData.name === 'generate_image' && imageUrl) {
       const toolCall = allToolCalls.find(
         (tc) => tc.id === resultData.toolCallId

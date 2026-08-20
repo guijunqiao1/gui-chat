@@ -89,6 +89,8 @@ export const MessageRepository = {
     content: string
     thinking?: string
     toolCalls?: Prisma.InputJsonValue
+    toolResults?: Prisma.InputJsonValue
+    attachments?: Prisma.InputJsonValue
   }) {
     return prisma.message.create({
       data,

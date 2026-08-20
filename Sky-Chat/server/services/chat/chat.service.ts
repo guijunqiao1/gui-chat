@@ -1,6 +1,6 @@
 /**
  * Chat Service - 聊天核心业务逻辑
- * 
+ *
  * 负责：
  * - 会话管理
  * - 消息创建
@@ -15,8 +15,14 @@ import { MessageRepository } from '@/server/repositories/message.repository'
 import { createChatCompletion } from '@/server/services/ai/siliconflow'
 import { buildContextMessages, appendAttachments } from './prompt.builder'
 import { createSSEStream, createSSEStreamWithTools } from './stream.handler'
-import { toolRegistry, ensureToolsReady } from '@/server/services/tools'
-
+import {
+  toolRegistry,
+  ensureToolsReady,
+  createKnowledgeSearchTool,
+  createMemorySearchTool,
+  type Tool,
+} from '@/server/services/tools'
+import { indexMemory } from '@/server/services/memory/indexer'
 
 export interface ChatRequest {
   content: string
@@ -26,10 +32,16 @@ export interface ChatRequest {
   thinkingBudget?: number
   enableWebSearch?: boolean
   enableImageGeneration?: boolean
+  enableMemorySearch?: boolean
   imageConfig?: { prompt: string; negative_prompt?: string; image_size: string }
   userMessageId?: string
   aiMessageId?: string
-  attachments?: Array<{ name: string; content: string; type: string; size: number }>
+  attachments?: Array<{
+    name: string
+    content: string
+    type: string
+    size: number
+  }>
 }
 
 export interface ChatResponse {
@@ -58,6 +70,7 @@ export async function handleChatRequest(
     thinkingBudget = 4096,
     enableWebSearch = false,
     enableImageGeneration: _enableImageGeneration = false,
+    enableMemorySearch = true,
     userMessageId,
     aiMessageId,
     attachments,
@@ -68,7 +81,27 @@ export async function handleChatRequest(
 
   // 2. 创建消息记录
   const messageId = aiMessageId || generateMessageId()
-  await createMessages(conversation.id, content, userMessageId, messageId, attachments)
+  await createMessages(
+    conversation.id,
+    content,
+    userMessageId,
+    messageId,
+    attachments
+  )
+
+  // 2.1 异步：用户消息写入长期记忆（RAG 场景 B）
+  if (enableMemorySearch) {
+    indexMemory({
+      userId,
+      conversationId: conversation.id,
+      messageId: userMessageId,
+      role: 'user',
+      content,
+      apiKey,
+    }).catch((err) =>
+      console.error('[ChatService] 用户消息记忆索引失败:', err.message)
+    )
+  }
 
   // 3. 更新会话标题（如果是第一条消息）
   const updatedTitle = await updateConversationTitle(conversation, content)
@@ -76,7 +109,7 @@ export async function handleChatRequest(
   // 4. 准备工具定义
   // - web_search: 需要用户手动开启
   // - generate_image: 始终可用（AI 自动判断何时调用）
-  const enabledTools = []
+  const enabledTools: Tool[] = []
   if (enableWebSearch && toolRegistry.has('web_search')) {
     enabledTools.push(toolRegistry.get('web_search')!)
   }
@@ -85,8 +118,21 @@ export async function handleChatRequest(
   if (imageAvailable) {
     enabledTools.push(toolRegistry.get('generate_image')!)
   }
-  const tools = enabledTools.length > 0
-    ? enabledTools.map(tool => ({
+  // RAG is request-scoped: the closure carries this user's id and API key.
+  // It must not be registered in the global registry, which is shared by
+  // concurrent chat requests.
+  if (process.env.ENABLE_RAG === 'true') {
+    enabledTools.push(createKnowledgeSearchTool(userId, apiKey))
+  }
+  // RAG 场景 B：跨会话记忆检索（默认启用）
+  if (enableMemorySearch) {
+    enabledTools.push(
+      createMemorySearchTool(userId, apiKey, conversation.id)
+    )
+  }
+  const tools =
+    enabledTools.length > 0
+      ? enabledTools.map((tool) => ({
         type: 'function' as const,
         function: {
           name: tool.name,
@@ -94,23 +140,37 @@ export async function handleChatRequest(
           parameters: tool.parameters,
         },
       }))
-    : undefined
+      : undefined
 
   // 调试日志
-  console.log('[ChatService] Enabled tools:', enabledTools.map(t => t.name))
+  console.log(
+    '[ChatService] Enabled tools:',
+    enabledTools.map((t) => t.name)
+  )
   if (!imageAvailable) {
-    console.log('[ChatService] Image generation unavailable, AI will be notified')
+    console.log(
+      '[ChatService] Image generation unavailable, AI will be notified'
+    )
   }
 
   // 5. 获取历史消息并构建上下文（传递图片可用状态）
-  const historyMessages = await MessageRepository.findByConversationId(conversation.id)
+  const historyMessages = await MessageRepository.findByConversationId(
+    conversation.id
+  )
   const currentUserMessage = appendAttachments(content, attachments)
-  const contextMessages = buildContextMessages(historyMessages, currentUserMessage, imageAvailable)
+  const contextMessages = buildContextMessages(
+    historyMessages,
+    currentUserMessage,
+    imageAvailable
+  )
 
   // 6. 调用 AI API
   const { reader } = await createChatCompletion(apiKey, {
     model,
-    messages: contextMessages as Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+    messages: contextMessages as Array<{
+      role: 'system' | 'user' | 'assistant'
+      content: string
+    }>,
     enableThinking,
     thinkingBudget,
     tools,
@@ -118,26 +178,31 @@ export async function handleChatRequest(
 
   // 7. 创建 SSE 流
   const sessionId = Date.now().toString()
-  
+
   // 如果有可用工具，使用支持工具调用的流处理器
   const hasTools = enabledTools.length > 0
   const stream = hasTools
     ? createSSEStreamWithTools(reader, {
-        messageId,
-        conversationId: conversation.id,
-        userId,
-        sessionId,
-        apiKey,
-        model,
-        contextMessages: contextMessages as Array<{ role: string; content: string }>,
-        enableThinking,
-        thinkingBudget,
-      })
+      messageId,
+      conversationId: conversation.id,
+      userId,
+      sessionId,
+      apiKey,
+      model,
+      contextMessages: contextMessages as Array<{
+        role: string
+        content: string
+      }>,
+      enableThinking,
+      thinkingBudget,
+      tools: enabledTools,
+    })
     : createSSEStream(reader, {
         messageId,
         conversationId: conversation.id,
         userId,
         sessionId,
+        apiKey,
       })
 
   return {
@@ -156,7 +221,10 @@ async function getOrCreateConversation(
   userId: string
 ) {
   if (conversationId) {
-    const conversation = await ConversationRepository.findById(conversationId, userId)
+    const conversation = await ConversationRepository.findById(
+      conversationId,
+      userId
+    )
     if (!conversation) {
       throw new NotFoundError('Conversation not found')
     }
@@ -173,7 +241,12 @@ async function createMessages(
   content: string,
   userMessageId: string | undefined,
   aiMessageId: string,
-  attachments?: Array<{ name: string; content: string; type: string; size: number }>
+  attachments?: Array<{
+    name: string
+    content: string
+    type: string
+    size: number
+  }>
 ): Promise<void> {
   const now = new Date()
   const userMessageTime = now
@@ -226,7 +299,8 @@ async function updateConversationTitle(
   })
 
   if (messageCount === 2 && conversation.title === '新对话') {
-    const newTitle = content.trim().substring(0, 20) + (content.length > 20 ? '...' : '')
+    const newTitle =
+      content.trim().substring(0, 20) + (content.length > 20 ? '...' : '')
     await prisma.conversation.update({
       where: { id: conversation.id },
       data: { title: newTitle },

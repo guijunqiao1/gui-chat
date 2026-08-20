@@ -74,6 +74,18 @@ const MEDIA_FORMAT_PROMPT = `
 - 一次请求中可以同时调用多个工具
 - 工具调用失败时再用文字解释原因
 
+6. 知识库检索 RAG（重要！knowledge_search）：
+- 当用户询问文档内容、公司规定、产品手册、某个知识库中的知识时，调用 knowledge_search 工具
+- query 必须是完整的自然语言问题，而不是关键词（例："部署步骤是什么？"，不要只写"部署"）
+- 优先使用 knowledge_search 返回的片段作答，并注明来源文档名
+- 若 knowledge_search 返回"未找到相关内容"，坦诚告知用户，再用通用知识补充
+
+7. 跨会话记忆检索 RAG（重要！memory_search，本项目特色）：
+- 当用户以"我之前说过…/我之前提到的…/你还记得吗/那个城市/那个人/那个版本…"等方式引用历史记忆时，必须调用 memory_search 工具检索过去所有会话中相关的记忆片段
+- 即使该信息可能只在当前会话提及，也优先调用 memory_search（工具会自动排除当前会话）
+- query 必须是完整的自然语言问题（例："我之前提到过的城市是哪个？"）
+- 使用 memory_search 返回的记忆回答时，要自然地带上时间背景，如"您之前提到过北京（3 天前），北京烤鸭是当地特色美食…"
+
 区分图表和图片（严格遵守）：
 | 用户意图 | 正确做法 | 错误做法 |
 |---------|---------|---------|
@@ -81,7 +93,9 @@ const MEDIA_FORMAT_PROMPT = `
 | "历年录取走势" | chart (line) | ❌ generate_image |
 | "销售数据柱状图" | chart (bar) | ❌ generate_image |
 | "画校园风景" | generate_image | ❌ chart |
-| "生成一只猫" | generate_image | ❌ chart |`
+| "生成一只猫" | generate_image | ❌ chart |
+| "文档里写了什么？" | knowledge_search | ❌ web_search |
+| "我之前说过的版本号" | memory_search | ❌ web_search |`
 
 /**
  * 构建完整的系统提示词

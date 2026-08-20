@@ -46,6 +46,10 @@ next-env.d.ts
 
 # Windsurf
 prisma/migrations/
+!prisma/migrations/
+prisma/migrations/*
+!prisma/migrations/20260815000000_add_rag_knowledge_base/
+!prisma/migrations/20260815000000_add_rag_knowledge_base/migration.sql
 .windsurf
 .claude
 .augment

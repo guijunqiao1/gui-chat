@@ -49,6 +49,8 @@ export class SSEWriter {
 
     if (tc.function.name === 'web_search') event.query = args.query
     if (tc.function.name === 'generate_image') event.prompt = args.prompt
+    if (tc.function.name === 'knowledge_search') event.query = args.query
+    if (tc.function.name === 'memory_search') event.query = args.query
 
     this._send(event)
   }
@@ -77,6 +79,14 @@ export class SSEWriter {
       event.imageUrl = parsed.url
       event.width = parsed.width
       event.height = parsed.height
+    }
+    if (result.name === 'knowledge_search') {
+      event.resultCount = (parsed.sources as unknown[] | undefined)?.length || 0
+      event.sources = parsed.sources || []
+    }
+    if (result.name === 'memory_search') {
+      event.resultCount = (parsed.sources as unknown[] | undefined)?.length || 0
+      event.sources = parsed.sources || []
     }
 
     this._send(event)

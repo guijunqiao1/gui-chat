@@ -5,6 +5,8 @@
 import { ToolRegistry } from './registry'
 import { createWebSearchTool } from './web-search'
 import { createImageGenerationTool } from './image-generation'
+import { createKnowledgeSearchTool } from './knowledge-search'
+import { createMemorySearchTool } from './memory-search'
 import { isSiliconFlowS3Available } from '@/server/services/image/network-probe'
 
 // 创建全局工具注册表
@@ -33,7 +35,9 @@ async function initTools(): Promise<void> {
       console.warn('[Tools] SiliconFlow S3 不可达，generate_image disabled')
     }
   } else {
-    console.warn('[Tools] SILICONFLOW_API_KEY not configured, generate_image disabled')
+    console.warn(
+      '[Tools] SILICONFLOW_API_KEY not configured, generate_image disabled'
+    )
   }
 }
 
@@ -64,4 +68,6 @@ export type {
 // 导出工具创建函数
 export { createWebSearchTool } from './web-search'
 export { createImageGenerationTool } from './image-generation'
+export { createKnowledgeSearchTool } from './knowledge-search'
+export { createMemorySearchTool } from './memory-search'
 export { ToolRegistry } from './registry'

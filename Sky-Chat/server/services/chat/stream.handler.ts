@@ -4,7 +4,7 @@
 
 import { parseSSELine, splitSSEBuffer } from '@/lib/utils/sse'
 import { createChatCompletion } from '@/server/services/ai/siliconflow'
-import { toolRegistry, type ToolCall } from '@/server/services/tools'
+import { toolRegistry, type Tool, type ToolCall } from '@/server/services/tools'
 import { formatToolMessages } from '@/server/services/tools/handler'
 import { executeImageGeneration } from '@/server/services/tools/image-generation'
 import { SSEWriter } from './sse-writer'
@@ -15,9 +15,14 @@ export interface StreamContext {
   conversationId: string
   userId: string
   sessionId: string
+  apiKey?: string
 }
 
-type ChatMessage = { role: string; content: string | null; tool_calls?: ToolCall[] }
+type ChatMessage = {
+  role: string
+  content: string | null
+  tool_calls?: ToolCall[]
+}
 
 export interface StreamContextWithTools extends StreamContext {
   apiKey: string
@@ -25,6 +30,7 @@ export interface StreamContextWithTools extends StreamContext {
   contextMessages: ChatMessage[]
   enableThinking: boolean
   thinkingBudget: number
+  tools: Tool[]
 }
 
 const MAX_TOOL_ROUNDS = 5
@@ -36,7 +42,18 @@ export function createSSEStreamWithTools(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   context: StreamContextWithTools
 ): ReadableStream {
-  const { messageId, conversationId, userId, sessionId, apiKey, model, contextMessages, enableThinking, thinkingBudget } = context
+  const {
+    messageId,
+    conversationId,
+    userId,
+    sessionId,
+    apiKey,
+    model,
+    contextMessages,
+    enableThinking,
+    thinkingBudget,
+    tools,
+  } = context
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
 
@@ -48,7 +65,11 @@ export function createSSEStreamWithTools(
         let thinkingContent = ''
         let finalAnswerContent = ''
         const allToolCalls: ToolCall[] = []
-        const allToolResults: Array<{ toolCallId: string; name: string; result: Record<string, unknown> }> = []
+        const allToolResults: Array<{
+          toolCallId: string
+          name: string
+          result: Record<string, unknown>
+        }> = []
 
         let currentMessages = [...contextMessages]
         let currentReader = reader
@@ -59,11 +80,22 @@ export function createSSEStreamWithTools(
           console.log(`[Stream] === 第 ${round} 轮 ===`)
 
           // 读取 AI 响应，同时启动工具执行
-          const { thinkingContent: roundThinking, answerContent: roundAnswer, toolCalls: roundToolCalls, toolPromises } =
-            await processAIResponseWithParallelTools(currentReader, decoder, writer)
+          const {
+            thinkingContent: roundThinking,
+            answerContent: roundAnswer,
+            toolCalls: roundToolCalls,
+            toolPromises,
+          } = await processAIResponseWithParallelTools(
+            currentReader,
+            decoder,
+            writer,
+            tools
+          )
 
           thinkingContent += roundThinking
-          console.log(`[Stream] AI 返回: answer=${roundAnswer.length}字, tools=${roundToolCalls.length}个`)
+          console.log(
+            `[Stream] AI 返回: answer=${roundAnswer.length}字, tools=${roundToolCalls.length}个`
+          )
 
           // 没有工具调用，结束
           if (roundToolCalls.length === 0) {
@@ -92,7 +124,11 @@ export function createSSEStreamWithTools(
           const toolMessages = formatToolMessages(toolResults)
           currentMessages = [
             ...currentMessages,
-            { role: 'assistant', content: roundAnswer || null, tool_calls: roundToolCalls },
+            {
+              role: 'assistant',
+              content: roundAnswer || null,
+              tool_calls: roundToolCalls,
+            },
             ...(toolMessages as ChatMessage[]),
           ]
 
@@ -100,16 +136,30 @@ export function createSSEStreamWithTools(
           console.log('[Stream] 发起下一轮 AI 请求')
           const { reader: nextReader } = await createChatCompletion(apiKey, {
             model,
-            messages: currentMessages as Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+            messages: currentMessages as Array<{
+              role: 'system' | 'user' | 'assistant'
+              content: string
+            }>,
             enableThinking,
             thinkingBudget,
-            tools: toolRegistry.getToolDefinitions(),
+            tools: tools.map((tool) => ({
+              type: 'function' as const,
+              function: {
+                name: tool.name,
+                description: tool.description,
+                parameters: tool.parameters,
+              },
+            })),
           })
           currentReader = nextReader
         }
 
         // 处理图片结果
-        const contentWithImages = processImageResults(finalAnswerContent, allToolCalls, allToolResults)
+        const contentWithImages = processImageResults(
+          finalAnswerContent,
+          allToolCalls,
+          allToolResults
+        )
 
         // 保存消息
         await persistMessage(messageId, conversationId, userId, {
@@ -117,7 +167,7 @@ export function createSSEStreamWithTools(
           answerContent: contentWithImages,
           toolCallsData: allToolCalls.length > 0 ? allToolCalls : null,
           toolResultsData: allToolResults.length > 0 ? allToolResults : null,
-        })
+        }, apiKey)
 
         writer.sendComplete()
         writer.close()
@@ -136,18 +186,33 @@ export function createSSEStreamWithTools(
 async function processAIResponseWithParallelTools(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   decoder: TextDecoder,
-  writer: SSEWriter
+  writer: SSEWriter,
+  tools: Tool[]
 ): Promise<{
   thinkingContent: string
   answerContent: string
   toolCalls: ToolCall[]
-  toolPromises: Promise<{ toolCallId: string; name: string; success: boolean; content: string }>[]
+  toolPromises: Promise<{
+    toolCallId: string
+    name: string
+    success: boolean
+    content: string
+  }>[]
 }> {
   let buffer = ''
   let thinkingContent = ''
   let answerContent = ''
-  const toolCallsChunks: Array<{ index: number; id?: string; function?: { name?: string; arguments?: string } }> = []
-  const toolPromises: Promise<{ toolCallId: string; name: string; success: boolean; content: string }>[] = []
+  const toolCallsChunks: Array<{
+    index: number
+    id?: string
+    function?: { name?: string; arguments?: string }
+  }> = []
+  const toolPromises: Promise<{
+    toolCallId: string
+    name: string
+    success: boolean
+    content: string
+  }>[] = []
   const startedTools = new Set<string>()
 
   while (true) {
@@ -185,17 +250,24 @@ async function processAIResponseWithParallelTools(
             if (!toolCallsChunks[idx]) toolCallsChunks[idx] = { index: idx }
             if (tc.id) toolCallsChunks[idx].id = tc.id
             if (tc.function) {
-              if (!toolCallsChunks[idx].function) toolCallsChunks[idx].function = {}
-              if (tc.function.name) toolCallsChunks[idx].function!.name = tc.function.name
+              if (!toolCallsChunks[idx].function)
+                toolCallsChunks[idx].function = {}
+              if (tc.function.name)
+                toolCallsChunks[idx].function!.name = tc.function.name
               if (tc.function.arguments) {
                 toolCallsChunks[idx].function!.arguments =
-                  (toolCallsChunks[idx].function!.arguments || '') + tc.function.arguments
+                  (toolCallsChunks[idx].function!.arguments || '') +
+                  tc.function.arguments
               }
             }
 
             // 检查是否可以启动工具（有完整的 id、name 和有效的 JSON arguments）
             const chunk = toolCallsChunks[idx]
-            if (chunk.id && chunk.function?.name && !startedTools.has(chunk.id)) {
+            if (
+              chunk.id &&
+              chunk.function?.name &&
+              !startedTools.has(chunk.id)
+            ) {
               // 尝试解析 arguments，如果是完整的 JSON 就启动
               const args = chunk.function.arguments || ''
               if (isCompleteJSON(args)) {
@@ -206,31 +278,40 @@ async function processAIResponseWithParallelTools(
                   function: { name: chunk.function.name, arguments: args },
                 }
                 writer.sendToolCall(toolCall)
-                console.log(`[Stream] 启动工具: ${chunk.function.name}, args: ${args}`)
-                toolPromises.push(startToolExecution(toolCall, writer))
+                console.log(
+                  `[Stream] 启动工具: ${chunk.function.name}, args: ${args}`
+                )
+                toolPromises.push(startToolExecution(toolCall, writer, tools))
               }
             }
           }
         }
-      } catch { /* ignore */ }
+      } catch {
+        /* ignore */
+      }
     }
   }
 
   // 构建完整的 toolCalls
   const toolCalls: ToolCall[] = toolCallsChunks
-    .filter(tc => tc.id && tc.function?.name)
-    .map(tc => ({
+    .filter((tc) => tc.id && tc.function?.name)
+    .map((tc) => ({
       id: tc.id!,
       type: 'function' as const,
-      function: { name: tc.function!.name!, arguments: tc.function!.arguments || '{}' },
+      function: {
+        name: tc.function!.name!,
+        arguments: tc.function!.arguments || '{}',
+      },
     }))
 
   // 流结束后，启动还没启动的工具（以防 JSON 在最后才完整）
   for (const tc of toolCalls) {
     if (!startedTools.has(tc.id)) {
       writer.sendToolCall(tc)
-      console.log(`[Stream] 延迟启动工具: ${tc.function.name}, args: ${tc.function.arguments}`)
-      toolPromises.push(startToolExecution(tc, writer))
+      console.log(
+        `[Stream] 延迟启动工具: ${tc.function.name}, args: ${tc.function.arguments}`
+      )
+      toolPromises.push(startToolExecution(tc, writer, tools))
     }
   }
 
@@ -242,13 +323,21 @@ async function processAIResponseWithParallelTools(
  */
 async function startToolExecution(
   toolCall: ToolCall,
-  writer: SSEWriter
-): Promise<{ toolCallId: string; name: string; success: boolean; content: string }> {
+  writer: SSEWriter,
+  tools: Tool[]
+): Promise<{
+  toolCallId: string
+  name: string
+  success: boolean
+  content: string
+}> {
   const name = toolCall.function.name
   let args: Record<string, unknown> = {}
   try {
     args = JSON.parse(toolCall.function.arguments)
-  } catch { /* ignore */ }
+  } catch {
+    /* ignore */
+  }
 
   try {
     if (name === 'generate_image') {
@@ -256,21 +345,39 @@ async function startToolExecution(
       const result = await executeImageGeneration(args, (progress) => {
         writer.sendToolProgress(toolCall.id, progress)
       })
-      return { toolCallId: toolCall.id, name, success: true, content: JSON.stringify(result) }
+      return {
+        toolCallId: toolCall.id,
+        name,
+        success: true,
+        content: JSON.stringify(result),
+      }
     } else {
       // 其他工具：直接执行
-      const content = await toolRegistry.executeByName(name, args)
+      const tool =
+        tools.find((candidate) => candidate.name === name) ||
+        toolRegistry.get(name)
+      if (!tool) throw new Error(`Tool "${name}" not found`)
+      const content = await tool.execute(args)
       return { toolCallId: toolCall.id, name, success: true, content }
     }
   } catch (error) {
     const msg = error instanceof Error ? error.message : '未知错误'
     console.error(`[Stream] 工具 ${name} 失败:`, msg)
-    return { toolCallId: toolCall.id, name, success: false, content: JSON.stringify({ error: msg }) }
+    return {
+      toolCallId: toolCall.id,
+      name,
+      success: false,
+      content: JSON.stringify({ error: msg }),
+    }
   }
 }
 
 function parseJSON(str: string): Record<string, unknown> {
-  try { return JSON.parse(str) } catch { return {} }
+  try {
+    return JSON.parse(str)
+  } catch {
+    return {}
+  }
 }
 
 /**
@@ -293,7 +400,7 @@ export function createSSEStream(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   context: StreamContext
 ): ReadableStream {
-  const { messageId, conversationId, userId, sessionId } = context
+  const { messageId, conversationId, userId, sessionId, apiKey } = context
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
 
@@ -309,7 +416,11 @@ export function createSSEStream(
         while (true) {
           const { done, value } = await reader.read()
           if (done) {
-            await persistMessage(messageId, conversationId, userId, { thinkingContent, answerContent, toolCallsData: null })
+            await persistMessage(messageId, conversationId, userId, {
+              thinkingContent,
+              answerContent,
+              toolCallsData: null,
+            }, apiKey)
             writer.sendComplete()
             writer.close()
             break
@@ -333,7 +444,9 @@ export function createSSEStream(
                 answerContent += delta.content
                 writer.sendAnswer(delta.content)
               }
-            } catch { /* ignore */ }
+            } catch {
+              /* ignore */
+            }
           }
         }
       } catch (error) {
