@@ -4,6 +4,10 @@
 
 /**
  * 工具参数 Schema
+ *
+ * 遵循 JSON Schema 标准，支持数值/字符串约束。
+ * 这些字段都是 OpenAI Function Calling / SiliconFlow tools API 原生识别的，
+ * 不加会导致工具想用 minimum/maximum/items 等约束时 TS 编译失败。
  */
 export interface ToolParameterSchema {
   type: 'object'
@@ -11,6 +15,20 @@ export interface ToolParameterSchema {
     type: string
     description: string
     enum?: string[]
+    // 数值约束
+    minimum?: number
+    maximum?: number
+    // 字符串约束
+    minLength?: number
+    maxLength?: number
+    pattern?: string
+    // 数组约束
+    items?: {
+      type: string
+      enum?: string[]
+    }
+    // 默认值（SiliconFlow/OpenAI 都会识别）
+    default?: unknown
   }>
   required: string[]
 }
