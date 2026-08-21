@@ -1,0 +1,454 @@
+name: Sky-Chat CI/CD (pnpm + Next.js standalone → TCR → ECS docker-compose)
+
+"on":
+  push:
+    branches:
+      - main
+      - master
+    paths-ignore:
+      - '**/*.md'
+      - '.gitignore'
+      - '.github/labeler.yml'
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      ecs_deploy:
+        description: '是否部署到 ECS（仅 push 到 main 时自动 true，手动运行可选 true/false）'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+###############################################################################
+# 环境变量（与本项目 Dockerfile / docker-compose.yml / prisma / RAG 对齐）
+###############################################################################
+env:
+  NODE_VERSION: '22'                        # 与项目 Dockerfile (node:22-alpine) 对齐
+  PNPM_VERSION: '9'                         # 与锁文件 pnpm-lock.yaml 生成版本兼容
+  APP_NAME: 'sky-chat-app'                  # 部署后 ECS 容器名前缀（docker-compose 服务名 app + postgres）
+  ECS_DEPLOY_DIR: '/opt/sky-chat-app'       # ECS 宿主机上的部署目录
+  # 构建期给 prisma generate 用的占位 DB_URL（运行时会被 ECS 上真实 DATABASE_URL 覆盖）
+  PRISMA_GENERATE_DATABASE_URL: 'postgresql://placeholder:placeholder@127.0.0.1:5432/placeholder'
+
+jobs:
+  #############################################################################
+  # Job 1. 代码校验 & 构建验证（所有 PR / push 都跑）
+  #############################################################################
+  validate:
+    name: 代码校验 / Prisma Generate / Next 构建验证
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 pnpm 与 Node
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
+
+      - name: 设置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: Prisma Generate（生成 Prisma Client TS 类型）
+        env:
+          DATABASE_URL: ${{ env.PRISMA_GENERATE_DATABASE_URL }}
+        run: pnpm db:generate
+
+      - name: Prettier 格式检查
+        run: pnpm format:check || echo "::warning::格式有差异，如需要本地运行 pnpm format"
+
+      - name: ESLint 代码规范检查
+        run: pnpm lint || echo "::warning::ESLint 有告警，建议处理"
+
+      - name: Next.js Production 构建（dry-run，不带业务真实环境变量）
+        env:
+          DATABASE_URL: ${{ env.PRISMA_GENERATE_DATABASE_URL }}
+          AUTH_SECRET: 'ci-build-placeholder-only-not-for-run'
+          JWT_SECRET: 'ci-build-placeholder-only-not-for-run'
+          NEXTAUTH_SECRET: 'ci-build-placeholder-only-not-for-run'
+          SILICONFLOW_API_KEY: 'ci-build-placeholder-only-not-for-run'
+          NEXT_TELEMETRY_DISABLED: '1'
+        run: pnpm build
+
+  #############################################################################
+  # Job 2. 构建 Docker 镜像并推送 TCR（仅 push 到 main/master 才跑）
+  #############################################################################
+  build-and-push-tcr:
+    name: 构建镜像 → TCR（带 pgvector / pnpm / standalone 缓存）
+    needs: validate
+    runs-on: ubuntu-latest
+    # push 到 main/master 才发 TCR；PR 不发；workflow_dispatch 手动勾选 ecs_deploy=true 也发
+    if: |
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.ecs_deploy == 'true')
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 检查 TCR 相关 Secrets
+        run: |
+          missing=""
+          [ -z "${{ secrets.TCR_REGISTRY }}" ]    && missing="${missing} TCR_REGISTRY"
+          [ -z "${{ secrets.TCR_NAMESPACE }}" ]   && missing="${missing} TCR_NAMESPACE"
+          [ -z "${{ secrets.TCR_REPOSITORY }}" ]  && missing="${missing} TCR_REPOSITORY"
+          [ -z "${{ secrets.TCR_USERNAME }}" ]    && missing="${missing} TCR_USERNAME"
+          [ -z "${{ secrets.TCR_PASSWORD }}" ]    && missing="${missing} TCR_PASSWORD"
+          if [ -n "${missing}" ]; then
+            echo "::error::下列 Secrets 缺失，无法推送到 TCR：${missing}"
+            echo "::error::请到 Settings → Secrets and variables → Actions 补齐（参考 README deploy 章节）。"
+            exit 1
+          fi
+
+      - name: 规范化 TCR 变量（去协议头 / 尾部斜杠 / 误填路径）
+        id: tcr-meta
+        run: |
+          REG="${{ secrets.TCR_REGISTRY }}"
+          NS="${{ secrets.TCR_NAMESPACE }}"
+          REPO="${{ secrets.TCR_REPOSITORY }}"
+
+          REG="${REG#http://}"; REG="${REG#https://}"; REG="${REG%/}"; REG="${REG%%/*}"
+          NS="${NS##*/}"; REPO="${REPO##*/}"
+
+          if [ -z "$NS" ] || [ -z "$REPO" ] || [ -z "$REG" ]; then
+            echo "::error::TCR_* 变量规范化后为空，请检查格式。registry=$REG namespace=$NS repository=$REPO"
+            exit 1
+          fi
+
+          IMAGE="${REG}/${NS}/${REPO}"
+          TAG_SHA="${GITHUB_SHA::7}"          # 短 sha：更易读
+          TAG_DATE="$(date +%Y%m%d)-${GITHUB_RUN_NUMBER}"
+          echo "image=$IMAGE"       >> "$GITHUB_OUTPUT"
+          echo "tag_sha=$TAG_SHA"   >> "$GITHUB_OUTPUT"
+          echo "tag_date=$TAG_DATE" >> "$GITHUB_OUTPUT"
+          echo "tag_latest=latest"  >> "$GITHUB_OUTPUT"
+          echo "==> Full image: ${IMAGE}:${TAG_SHA}"
+
+      - name: 准备 Docker Buildx (含缓存到 GHA)
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录腾讯云 TCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.TCR_REGISTRY }}
+          username: ${{ secrets.TCR_USERNAME }}
+          password: ${{ secrets.TCR_PASSWORD }}
+          logout: true
+
+      - name: 构建并推送镜像（3 个 tag：sha / 日期构建号 / latest）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          # 利用 GitHub Actions 内置缓存加速下次构建
+          cache-from: type=gha,scope=sky-chat-app
+          cache-to:   type=gha,scope=sky-chat-app,mode=max
+          tags: |
+            ${{ steps.tcr-meta.outputs.image }}:${{ steps.tcr-meta.outputs.tag_sha }}
+            ${{ steps.tcr-meta.outputs.image }}:${{ steps.tcr-meta.outputs.tag_date }}
+            ${{ steps.tcr-meta.outputs.image }}:${{ steps.tcr-meta.outputs.tag_latest }}
+          build-args: |
+            DATABASE_URL=${{ env.PRISMA_GENERATE_DATABASE_URL }}
+          # 保证构建阶段有 prisma generate 所需 env（运行时会被 DATABASE_URL env 覆盖）
+          secrets: |
+            BUILDKIT_INLINE_CACHE=1
+
+      - name: 输出镜像版本（deploy job 复用）
+        run: |
+          echo "TCR_FULL_IMAGE=${{ steps.tcr-meta.outputs.image }}:${{ steps.tcr-meta.outputs.tag_sha }}" >> "$GITHUB_ENV"
+          echo "TCR_SHORT_SHA=${{ steps.tcr-meta.outputs.tag_sha }}" >> "$GITHUB_ENV"
+          echo "TCR_IMAGE_BASE=${{ steps.tcr-meta.outputs.image }}" >> "$GITHUB_ENV"
+
+  #############################################################################
+  # Job 3. 部署到 ECS（SSH + docker-compose 滚动重启）
+  #############################################################################
+  deploy-ecs:
+    name: 部署到 ECS 宿主机（docker compose up -d + pgvector 检查 + /api/health）
+    needs: build-and-push-tcr
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.ecs_deploy == 'true')
+
+    steps:
+      - name: 检出代码（需要把 docker-compose.yml 上传到 ECS）
+        uses: actions/checkout@v4
+
+      - name: 检查 ECS + TCR + 生产 .env Secrets
+        run: |
+          missing=""
+          # ============ ECS SSH ============
+          [ -z "${{ secrets.ECS_HOST }}" ]                && missing="${missing} ECS_HOST"
+          [ -z "${{ secrets.ECS_USER }}" ]                && missing="${missing} ECS_USER"
+          [ -z "${{ secrets.ECS_SSH_PRIVATE_KEY }}" ]     && missing="${missing} ECS_SSH_PRIVATE_KEY"
+          # ============ TCR（ECS 上要登录并拉取）============
+          [ -z "${{ secrets.TCR_REGISTRY }}" ]            && missing="${missing} TCR_REGISTRY"
+          [ -z "${{ secrets.TCR_NAMESPACE }}" ]           && missing="${missing} TCR_NAMESPACE"
+          [ -z "${{ secrets.TCR_REPOSITORY }}" ]          && missing="${missing} TCR_REPOSITORY"
+          [ -z "${{ secrets.TCR_USERNAME }}" ]            && missing="${missing} TCR_USERNAME"
+          [ -z "${{ secrets.TCR_PASSWORD }}" ]            && missing="${missing} TCR_PASSWORD"
+          # ============ 生产 .env ============
+          if [ -z "${{ secrets.PROD_ENV_FILE }}" ] && [ -z "${{ secrets.DATABASE_URL }}" ]; then
+            # 允许二选一：要么一次性 PROD_ENV_FILE，要么按 key 配 DATABASE_URL + AUTH_SECRET 等
+            missing="${missing} PROD_ENV_FILE（或分别配置 DATABASE_URL/AUTH_SECRET/JWT_SECRET/SILICONFLOW_API_KEY）"
+          fi
+          if [ -n "${missing}" ]; then
+            echo "::error::下列 Secrets 缺失，无法部署到 ECS：${missing}"
+            echo "::error::请在 Settings → Secrets and variables → Actions 补齐。"
+            echo "::error::ECS_SSH_PRIVATE_KEY 必须是完整 PEM（含 -----BEGIN RSA PRIVATE KEY----- / -----END）"
+            exit 1
+          fi
+
+      - name: 准备 SSH 客户端 + 写入私钥 + 信任 ECS hostkey
+        run: |
+          set -e
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          # 去除私钥可能的 \r、头尾空行；确保末尾有且仅有一个换行
+          printf '%s\n' "${{ secrets.ECS_SSH_PRIVATE_KEY }}" \
+            | tr -d '\r' \
+            | sed '/^$/d; /^$/N; /^$/d' \
+            > "$HOME/.ssh/id_rsa"
+          # 保证头尾标识行正确包裹内容（安全兜底）
+          if ! head -n1 "$HOME/.ssh/id_rsa" | grep -q '^-----BEGIN'; then
+            echo "::error::ECS_SSH_PRIVATE_KEY 首行不是 -----BEGIN...PRIVATE KEY-----，请复制完整私钥。"
+            exit 1
+          fi
+          if ! tail -n1 "$HOME/.ssh/id_rsa" | grep -q '^-----END'; then
+            echo "::warning::ECS_SSH_PRIVATE_KEY 尾行缺失 -----END，尝试自动补齐。"
+            LINE1=$(head -n1 "$HOME/.ssh/id_rsa")
+            if echo "$LINE1" | grep -q "OPENSSH"; then
+              echo "-----END OPENSSH PRIVATE KEY-----" >> "$HOME/.ssh/id_rsa"
+            else
+              echo "-----END RSA PRIVATE KEY-----" >> "$HOME/.ssh/id_rsa"
+            fi
+          fi
+          chmod 600 "$HOME/.ssh/id_rsa"
+          ssh-keyscan -H "${{ secrets.ECS_HOST }}" >> "$HOME/.ssh/known_hosts" 2>/dev/null || true
+          echo "SSH 配置完成"
+
+      - name: 上传 docker-compose.yml 与 生产 .env 到 ECS
+        run: |
+          set -e
+          HOST="${{ secrets.ECS_USER }}@${{ secrets.ECS_HOST }}"
+          DEPLOY_DIR="${{ env.ECS_DEPLOY_DIR }}"
+
+          # 1) 创建部署目录 + 数据目录
+          ssh -o StrictHostKeyChecking=no "$HOST" "mkdir -p '$DEPLOY_DIR/generated' && chmod -R 755 '$DEPLOY_DIR'"
+
+          # 2) 上传 docker-compose.yml（rsync 优先，scp 兜底）
+          if command -v rsync >/dev/null 2>&1; then
+            rsync -e 'ssh -o StrictHostKeyChecking=no' -avz --delete \
+              ./docker-compose.yml "$HOST:$DEPLOY_DIR/docker-compose.yml"
+          else
+            scp -o StrictHostKeyChecking=no ./docker-compose.yml "$HOST:$DEPLOY_DIR/docker-compose.yml"
+          fi
+
+          # 3) 生成 / 上生产环境变量文件
+          if [ -n "${{ secrets.PROD_ENV_FILE }}" ]; then
+            # 优先：一次性 PROD_ENV_FILE（含 DATABASE_URL/AUTH_SECRET/OAuth/RAG 开关 所有）
+            printf '%s\n' "${{ secrets.PROD_ENV_FILE }}" | tr -d '\r' > /tmp/prod.env
+          else
+            # 备选：按 key 逐条拼接
+            {
+              echo "DATABASE_URL=${{ secrets.DATABASE_URL }}"
+              echo "AUTH_SECRET=${{ secrets.AUTH_SECRET }}"
+              echo "NEXTAUTH_SECRET=${{ secrets.NEXTAUTH_SECRET }}"
+              echo "NEXTAUTH_URL=${{ secrets.NEXTAUTH_URL }}"
+              echo "JWT_SECRET=${{ secrets.JWT_SECRET }}"
+              echo "SILICONFLOW_API_KEY=${{ secrets.SILICONFLOW_API_KEY }}"
+              echo "ENABLE_RAG=${{ secrets.ENABLE_RAG:-true }}"
+              echo "RAG_EMBEDDING_MODEL=${{ secrets.RAG_EMBEDDING_MODEL:-BAAI/bge-m3 }}"
+              echo "TAVILY_API_KEY=${{ secrets.TAVILY_API_KEY }}"
+              echo "GOOGLE_CLIENT_ID=${{ secrets.GOOGLE_CLIENT_ID }}"
+              echo "GOOGLE_CLIENT_SECRET=${{ secrets.GOOGLE_CLIENT_SECRET }}"
+              echo "GITHUB_CLIENT_ID=${{ secrets.GITHUB_CLIENT_ID }}"
+              echo "GITHUB_CLIENT_SECRET=${{ secrets.GITHUB_CLIENT_SECRET }}"
+              echo "NEXT_PUBLIC_APP_URL=${{ secrets.NEXT_PUBLIC_APP_URL }}"
+              echo "NODE_ENV=production"
+            } > /tmp/prod.env
+          fi
+
+          # 写 DATABASE_URL 成 ECS 宿主机 docker-compose 内网 postgres 的格式（如果 DATABASE_URL 未指定具体域名，就按 docker 内网注入）
+          # 这里保留用户 PROD_ENV_FILE 里真实写的 DATABASE_URL，不覆盖
+          scp -o StrictHostKeyChecking=no /tmp/prod.env "$HOST:$DEPLOY_DIR/.env"
+          ssh -o StrictHostKeyChecking=no "$HOST" "chmod 600 '$DEPLOY_DIR/.env' && wc -l '$DEPLOY_DIR/.env'"
+
+      - name: 在 ECS 上 docker-compose 登录 TCR → 拉取 → 建 pgvector → 启动容器
+        run: |
+          set -e
+          HOST="${{ secrets.ECS_USER }}@${{ secrets.ECS_HOST }}"
+          DEPLOY_DIR="${{ env.ECS_DEPLOY_DIR }}"
+
+          # 为镜像地址 + 短 SHA tag 计算一次并注入到远端 shell
+          REG="${{ secrets.TCR_REGISTRY }}"
+          NS="${{ secrets.TCR_NAMESPACE }}"
+          REPO="${{ secrets.TCR_REPOSITORY }}"
+          REG="${REG#http://}"; REG="${REG#https://}"; REG="${REG%/}"; REG="${REG%%/*}"
+          NS="${NS##*/}"; REPO="${REPO##*/}"
+          IMAGE_BASE="${REG}/${NS}/${REPO}"
+          TAG_SHA="${GITHUB_SHA::7}"
+
+          ssh -o StrictHostKeyChecking=no "$HOST" \
+            DEPLOY_DIR="'$DEPLOY_DIR'" \
+            IMAGE_BASE="'$IMAGE_BASE'" \
+            TAG_SHA="'$TAG_SHA'" \
+            TCR_REGISTRY="'${{ secrets.TCR_REGISTRY }}'" \
+            TCR_USERNAME="'${{ secrets.TCR_USERNAME }}'" \
+            TCR_PASSWORD="'${{ secrets.TCR_PASSWORD }}'" \
+            'bash -se' << 'REMOTE'
+          set -e
+          cd "$DEPLOY_DIR"
+
+          # ------------------------------------------------------------------
+          # 1) 确保 docker compose plugin 已装
+          # ------------------------------------------------------------------
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "==> [1/7] 安装 Docker"
+            if command -v apt-get >/dev/null 2>&1; then
+              apt-get update -y
+              apt-get install -y ca-certificates curl gnupg lsb-release
+              curl -fsSL https://get.docker.com | sh
+            else
+              echo "::error::当前 ECS 镜像 OS 不是 debian 系，无法自动安装 Docker，请手动安装 Docker & docker compose plugin。"
+              exit 1
+            fi
+          fi
+          if command -v systemctl >/dev/null 2>&1; then
+            systemctl enable docker || true
+            systemctl restart docker 2>/dev/null || systemctl start docker || true
+          fi
+          # docker compose v2 plugin 兼容性（旧版 docker-compose 也要能用）
+          if docker compose version >/dev/null 2>&1; then
+            COMPOSE="docker compose"
+          elif command -v docker-compose >/dev/null 2>&1; then
+            COMPOSE="docker-compose"
+          else
+            echo "==> 安装 docker compose v2 plugin"
+            DOCKER_CONFIG=${DOCKER_CONFIG:-/usr/local/lib/docker/cli-plugins}
+            mkdir -p "$DOCKER_CONFIG"
+            VER=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep -oE '"tag_name":.*"' | head -n1 | cut -d'"' -f4)
+            curl -SL "https://github.com/docker/compose/releases/download/${VER}/docker-compose-linux-$(uname -m)" -o "$DOCKER_CONFIG/docker-compose"
+            chmod +x "$DOCKER_CONFIG/docker-compose"
+            COMPOSE="docker compose"
+          fi
+          echo "==> [1/7] Compose 版本: $($COMPOSE version 2>&1 || true)"
+
+          # ------------------------------------------------------------------
+          # 2) TCR 登录（ECS 宿主机上执行）
+          # ------------------------------------------------------------------
+          echo "==> [2/7] 登录 TCR"
+          echo "$TCR_PASSWORD" | docker login "$TCR_REGISTRY" -u "$TCR_USERNAME" --password-stdin
+
+          # ------------------------------------------------------------------
+          # 3) 覆盖 .env 中 APP_IMAGE=xxx 给 docker-compose.yml 的 app.build.image 或 app.image 使用
+          #    如果 docker-compose.yml 是 build 模式则改为 prebuilt 镜像模式：这里用 envsubst 生成一个临时覆盖文件
+          # ------------------------------------------------------------------
+          echo "==> [3/7] 准备覆盖镜像的 docker-compose.override.yml"
+          cat > docker-compose.override.yml <<YAML
+          services:
+            app:
+              image: '${IMAGE_BASE}:${TAG_SHA}'
+              build: null
+          YAML
+          cat docker-compose.override.yml
+
+          # ------------------------------------------------------------------
+          # 4) 拉取新镜像 + 保证 postgres 镜像也更新
+          # ------------------------------------------------------------------
+          echo "==> [4/7] 拉取镜像：${IMAGE_BASE}:${TAG_SHA}"
+          $COMPOSE pull --include-deps || $COMPOSE pull app postgres || true
+          # 兜底 docker pull
+          docker pull "${IMAGE_BASE}:${TAG_SHA}"
+
+          # ------------------------------------------------------------------
+          # 5) 先启动 pgvector 数据库并确保扩展已安装（先启动 DB，不然 migrate deploy 会报 42883）
+          # ------------------------------------------------------------------
+          echo "==> [5/7] 启动 postgres，创建 pgvector 扩展并等待健康"
+          $COMPOSE up -d postgres
+          for i in 1 2 3 4 5 6 7 8; do
+            if $COMPOSE ps -q postgres | grep -q '.'; then
+              # 对 docker compose plugin 运行 SQL
+              if docker compose version >/dev/null 2>&1; then
+                docker compose exec -T postgres \
+                  psql -v ON_ERROR_STOP=1 -U guichat -d guichat -c "CREATE EXTENSION IF NOT EXISTS vector;" \
+                  >/dev/null 2>&1 \
+                  && echo "pgvector 扩展已就绪（docker compose exec -T）" \
+                  && break
+              else
+                docker-compose exec -T postgres \
+                  psql -v ON_ERROR_STOP=1 -U guichat -d guichat -c "CREATE EXTENSION IF NOT EXISTS vector;" \
+                  >/dev/null 2>&1 \
+                  && echo "pgvector 扩展已就绪（docker-compose exec -T）" \
+                  && break
+              fi
+            fi
+            echo "Postgres 未就绪，等 5s（$i/8）..."
+            sleep 5
+          done
+
+          # ------------------------------------------------------------------
+          # 6) 应用滚动更新（旧容器会被新镜像替换，next standalone + postgres 保持运行）
+          # ------------------------------------------------------------------
+          echo "==> [6/7] docker compose up -d（app + postgres）"
+          $COMPOSE up -d --remove-orphans
+
+          # 等容器启动几秒
+          sleep 6
+          echo "==> 容器状态："
+          $COMPOSE ps
+
+          # ------------------------------------------------------------------
+          # 7) ECS 本机健康检查（/api/health 由 Next 提供，见 docker-compose.yml healthcheck）
+          # ------------------------------------------------------------------
+          echo "==> [7/7] 本机健康检查 http://127.0.0.1:3000/api/health"
+          for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            if curl -fsS --max-time 4 http://127.0.0.1:3000/api/health >/dev/null; then
+              echo "✅ ECS 本机健康检查通过"
+              exit 0
+            fi
+            echo "未就绪，等待 5s（$i/12）..."
+            sleep 5
+          done
+          echo "::error::❌ ECS 本机健康检查失败，按顺序排障："
+          echo "::error::1) $COMPOSE logs -n 200 app"
+          echo "::error::2) $COMPOSE logs -n 200 postgres"
+          echo "::error::3) 确认 KnowledgeChunk (pgvector) / ConversationMemory (Json) 表已成功创建"
+          echo "::error::4) 检查是否缺失 SILICONFLOW_API_KEY / DATABASE_URL / AUTH_SECRET 导致 Next 启动中止"
+          exit 1
+          REMOTE
+
+      - name: 公网可达性验证（安全组放行了 3000 才会过；否则部署任务也成功，只是公网不开）
+        run: |
+          echo "==> 公网可达性验证（放行 3000 端口时会通过）"
+          for i in 1 2 3 4 5; do
+            if curl -fsS --connect-timeout 5 --max-time 10 "http://${{ secrets.ECS_HOST }}:3000/api/health" >/dev/null; then
+              echo "✅ 公网健康检查通过：http://${{ secrets.ECS_HOST }}:3000/api/health"
+              exit 0
+            fi
+            echo "公网未响应 $i/5（如安全组未放行 3000，可忽略；建议 CLB/CDN 代理 443→3000）。"
+            sleep 4
+          done
+          echo "::notice::公网 3000 端口未直接开放，属正常情况（线上推荐 CLB + HTTPS 443 反代到 ECS 3000）。已跳过硬失败。"
+
+      - name: 输出部署成功信息
+        run: |
+          echo "🎉 Sky-Chat 部署完成"
+          echo "   ECS 内网健康检查：已通过"
+          echo "   本次 TCR 镜像：${{ env.TCR_FULL_IMAGE || '(见 build-push job)' }}"
+          echo "   部署目录：${{ env.ECS_DEPLOY_DIR }}（ECS 上）"
+          echo "   日志命令（在 ECS）：cd ${{ env.ECS_DEPLOY_DIR }} && docker compose logs -f --tail 200 app postgres"
