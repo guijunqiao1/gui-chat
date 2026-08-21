@@ -1,3 +1,11 @@
+# 本项目虽为单包，但为了使用 pnpm 的 allowBuilds 安全白名单（只允许指定本地二进制包构建，防御供应链攻击）
+# 仍启用 workspace 模式：唯一子包就是当前目录自己。
+# ⚠️ packages 字段不可删除/留空：否则 pnpm install 会报 "packages field missing or empty"
+packages:
+  - '.'
+
+# 仅允许以下包在安装时执行 postinstall / build 脚本（下载并编译 C/C++ 原生二进制）
+# 推荐保持显式白名单，避免恶意依赖在 npm install 阶段执行任意代码
 allowBuilds:
   '@prisma/client': true
   '@prisma/engines': true
