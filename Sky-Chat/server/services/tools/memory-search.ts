@@ -8,6 +8,7 @@
  */
 
 import { prisma } from '@/server/db/client'
+import { Prisma } from '@prisma/client'
 import type { Tool } from './types'
 
 const EMBEDDINGS_URL = 'https://api.siliconflow.cn/v1/embeddings'
@@ -99,12 +100,14 @@ export function createMemorySearchTool(
         const qVec = await createEmbedding(query.trim(), apiKey)
 
         // 查询该用户所有记忆（排除当前会话）
-        const where: { userId: string; embedding?: { not: null } } = {
-          userId,
-          embedding: { not: null },
-        }
+        // Prisma 6 的 Json 字段非空过滤要用专门的 DbNull 引用，
+        // 写 { not: null } 会被推到 JsonNullableFilter 上下文触发 TS 类型错误。
+        // 最稳妥写法：用 Prisma.DbNull 显式标记 JSON 类型的 null 值。
         const allMemories = await prisma.conversationMemory.findMany({
-          where,
+          where: {
+            userId,
+            NOT: { embedding: Prisma.DbNull },
+          },
           orderBy: { createdAt: 'desc' },
           take: 500,
         })
