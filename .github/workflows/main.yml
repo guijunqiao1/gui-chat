@@ -28,12 +28,19 @@ name: Sky-Chat CI/CD (pnpm + Next.js standalone → TCR → ECS docker-compose)
 # 环境变量（与本项目 Dockerfile / docker-compose.yml / prisma / RAG 对齐）
 ###############################################################################
 env:
+  PROJECT_ROOT: 'Sky-Chat'                  # ⚠️ Next.js 项目位于仓库 Sky-Chat/ 子目录，不是仓库根
   NODE_VERSION: '22'                        # 与项目 Dockerfile (node:22-alpine) 对齐
   PNPM_VERSION: '9'                         # 与锁文件 pnpm-lock.yaml 生成版本兼容
   APP_NAME: 'sky-chat-app'                  # 部署后 ECS 容器名前缀（docker-compose 服务名 app + postgres）
   ECS_DEPLOY_DIR: '/opt/sky-chat-app'       # ECS 宿主机上的部署目录
   # 构建期给 prisma generate 用的占位 DB_URL（运行时会被 ECS 上真实 DATABASE_URL 覆盖）
   PRISMA_GENERATE_DATABASE_URL: 'postgresql://placeholder:placeholder@127.0.0.1:5432/placeholder'
+  # ---------------------------------------------------------------------------
+  # GitHub Node20 → Node24 迁移：消除 "Node 20 is being deprecated" 警告
+  # 参考：https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+  # ---------------------------------------------------------------------------
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: 'true' # 兜底，若个别 action 仍声明只支持 node20 时不被阻塞
 
 jobs:
   #############################################################################
@@ -42,22 +49,30 @@ jobs:
   validate:
     name: 代码校验 / Prisma Generate / Next 构建验证
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        # ⚠️ 项目位于仓库 Sky-Chat/ 子目录，所有 run 步骤默认在该子目录执行
+        working-directory: ${{ env.PROJECT_ROOT }}
 
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5  # v5 原生支持 Node 24（消除 Node20 deprecation 告警）
 
       - name: 安装 pnpm 与 Node
         uses: pnpm/action-setup@v4
         with:
           version: ${{ env.PNPM_VERSION }}
           run_install: false
+          # pnpm 的 store 默认在 ~/.local/share/pnpm/store；配合 setup-node 缓存工作正常
+          package_json_file: '${{ env.PROJECT_ROOT }}/package.json'
 
       - name: 设置 Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5  # v5 原生支持 Node 24
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'pnpm'
+          # ⚠️ 重点：显式告诉 setup-node pnpm-lock.yaml 位于 Sky-Chat/ 子目录（否则会报锁文件不存在）
+          cache-dependency-path: '${{ env.PROJECT_ROOT }}/pnpm-lock.yaml'
 
       - name: 安装依赖
         run: pnpm install --frozen-lockfile
@@ -97,7 +112,7 @@ jobs:
 
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: 检查 TCR 相关 Secrets
         run: |
@@ -151,8 +166,9 @@ jobs:
       - name: 构建并推送镜像（3 个 tag：sha / 日期构建号 / latest）
         uses: docker/build-push-action@v6
         with:
-          context: .
-          file: ./Dockerfile
+          # ⚠️ Dockerfile 与构建上下文位于仓库子目录 Sky-Chat/（不是仓库根）
+          context: ${{ env.PROJECT_ROOT }}
+          file: ${{ env.PROJECT_ROOT }}/Dockerfile
           push: true
           # 利用 GitHub Actions 内置缓存加速下次构建
           cache-from: type=gha,scope=sky-chat-app
@@ -186,7 +202,7 @@ jobs:
 
     steps:
       - name: 检出代码（需要把 docker-compose.yml 上传到 ECS）
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: 检查 ECS + TCR + 生产 .env Secrets
         run: |
@@ -250,12 +266,13 @@ jobs:
           # 1) 创建部署目录 + 数据目录
           ssh -o StrictHostKeyChecking=no "$HOST" "mkdir -p '$DEPLOY_DIR/generated' && chmod -R 755 '$DEPLOY_DIR'"
 
-          # 2) 上传 docker-compose.yml（rsync 优先，scp 兜底）
+          # 2) 上传 docker-compose.yml（rsync 优先，scp 兜底）⚠️ 文件位于 Sky-Chat/ 子目录
+          COMPOSE_SRC="${{ env.PROJECT_ROOT }}/docker-compose.yml"
           if command -v rsync >/dev/null 2>&1; then
             rsync -e 'ssh -o StrictHostKeyChecking=no' -avz --delete \
-              ./docker-compose.yml "$HOST:$DEPLOY_DIR/docker-compose.yml"
+              "$COMPOSE_SRC" "$HOST:$DEPLOY_DIR/docker-compose.yml"
           else
-            scp -o StrictHostKeyChecking=no ./docker-compose.yml "$HOST:$DEPLOY_DIR/docker-compose.yml"
+            scp -o StrictHostKeyChecking=no "$COMPOSE_SRC" "$HOST:$DEPLOY_DIR/docker-compose.yml"
           fi
 
           # 3) 生成 / 上生产环境变量文件
