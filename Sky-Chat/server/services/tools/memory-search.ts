@@ -100,13 +100,13 @@ export function createMemorySearchTool(
         const qVec = await createEmbedding(query.trim(), apiKey)
 
         // 查询该用户所有记忆（排除当前会话）
-        // Prisma 6 的 Json 字段非空过滤要用专门的 DbNull 引用，
-        // 写 { not: null } 会被推到 JsonNullableFilter 上下文触发 TS 类型错误。
-        // 最稳妥写法：用 Prisma.DbNull 显式标记 JSON 类型的 null 值。
+        // Prisma 6 的 Json 字段非空过滤要用专门的 DbNull 引用。
+        // 注意：JsonNullableFilter 上下文下不能直接写 { embedding: Prisma.DbNull }，
+        // 必须用 { equals: Prisma.DbNull } 显式包裹，否则 TS 报 DbNull 不可赋值。
         const allMemories = await prisma.conversationMemory.findMany({
           where: {
             userId,
-            NOT: { embedding: Prisma.DbNull },
+            NOT: { embedding: { equals: Prisma.DbNull } },
           },
           orderBy: { createdAt: 'desc' },
           take: 500,
