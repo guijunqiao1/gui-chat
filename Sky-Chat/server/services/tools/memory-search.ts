@@ -127,7 +127,11 @@ export function createMemorySearchTool(
           .filter((s) => s.score > 0)
           .sort((a, b) => b.score - a.score)
 
-        const topK = Math.min(args.top_k ?? 5, 20)
+        // args 是 Record<string, unknown>，top_k 类型为 unknown，
+        // 直接 ?? 5 会得到 {} 类型而非 number，Math.min 会拒绝。
+        // 用 typeof 守卫做类型收窄，与上面 query 的处理方式保持一致。
+        const rawTopK = args.top_k
+        const topK = Math.min(typeof rawTopK === 'number' ? rawTopK : 5, 20)
         const hits = scored.slice(0, topK)
 
         if (hits.length === 0) {
