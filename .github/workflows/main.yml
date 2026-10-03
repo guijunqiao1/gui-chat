@@ -1,4 +1,4 @@
-name: Sky-Chat CI/CD (pnpm + Next.js standalone → TCR → ECS docker-compose)
+name: Gui-Chat CI/CD (pnpm + Next.js standalone → TCR → ECS docker-compose)
 
 "on":
   push:
@@ -28,10 +28,10 @@ name: Sky-Chat CI/CD (pnpm + Next.js standalone → TCR → ECS docker-compose)
 # 环境变量（与本项目 Dockerfile / docker-compose.yml / prisma / RAG 对齐）
 ###############################################################################
 env:
-  PROJECT_ROOT: 'Sky-Chat'                  # ⚠️ Next.js 项目位于仓库 Sky-Chat/ 子目录，不是仓库根
+  PROJECT_ROOT: 'gui-chat'                  # ⚠️ Next.js 项目位于仓库 gui-chat/ 子目录，不是仓库根（原 Sky-Chat 已改名）
   NODE_VERSION: '22'                        # 与项目 Dockerfile (node:22-alpine) 对齐
   PNPM_VERSION: '9'                         # 与锁文件 pnpm-lock.yaml 生成版本兼容
-  APP_NAME: 'sky-chat-app'                  # 部署后 ECS 容器名前缀（docker-compose 服务名 app + postgres）
+  APP_NAME: 'gui-chat-app'                  # 部署后 ECS 容器名前缀（docker-compose 服务名 app + postgres）
   ECS_DEPLOY_DIR: '/opt/sky-chat-app'       # ECS 宿主机上的部署目录
   # 构建期给 prisma generate 用的占位 DB_URL（运行时会被 ECS 上真实 DATABASE_URL 覆盖）
   PRISMA_GENERATE_DATABASE_URL: 'postgresql://placeholder:placeholder@127.0.0.1:5432/placeholder'
@@ -51,7 +51,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        # ⚠️ 项目位于仓库 Sky-Chat/ 子目录，所有 run 步骤默认在该子目录执行
+        # ⚠️ 项目位于仓库 gui-chat/ 子目录，所有 run 步骤默认在该子目录执行
         working-directory: ${{ env.PROJECT_ROOT }}
 
     steps:
@@ -71,7 +71,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'pnpm'
-          # ⚠️ 重点：显式告诉 setup-node pnpm-lock.yaml 位于 Sky-Chat/ 子目录（否则会报锁文件不存在）
+          # ⚠️ 重点：显式告诉 setup-node pnpm-lock.yaml 位于 gui-chat/ 子目录（否则会报锁文件不存在）
           cache-dependency-path: '${{ env.PROJECT_ROOT }}/pnpm-lock.yaml'
 
       - name: 安装依赖
@@ -166,7 +166,7 @@ jobs:
       - name: 构建并推送镜像（3 个 tag：sha / 日期构建号 / latest）
         uses: docker/build-push-action@v6
         with:
-          # ⚠️ Dockerfile 与构建上下文位于仓库子目录 Sky-Chat/（不是仓库根）
+          # ⚠️ Dockerfile 与构建上下文位于仓库子目录 gui-chat/（不是仓库根）
           context: ${{ env.PROJECT_ROOT }}
           file: ${{ env.PROJECT_ROOT }}/Dockerfile
           push: true
@@ -266,7 +266,7 @@ jobs:
           # 1) 创建部署目录 + 数据目录
           ssh -o StrictHostKeyChecking=no "$HOST" "mkdir -p '$DEPLOY_DIR/generated' && chmod -R 755 '$DEPLOY_DIR'"
 
-          # 2) 上传 docker-compose.yml（rsync 优先，scp 兜底）⚠️ 文件位于 Sky-Chat/ 子目录
+          # 2) 上传 docker-compose.yml（rsync 优先，scp 兜底）⚠️ 文件位于 gui-chat/ 子目录
           COMPOSE_SRC="${{ env.PROJECT_ROOT }}/docker-compose.yml"
           if command -v rsync >/dev/null 2>&1; then
             rsync -e 'ssh -o StrictHostKeyChecking=no' -avz --delete \
@@ -464,7 +464,7 @@ jobs:
 
       - name: 输出部署成功信息
         run: |
-          echo "🎉 Sky-Chat 部署完成"
+          echo "🎉 Gui-Chat 部署完成"
           echo "   ECS 内网健康检查：已通过"
           echo "   本次 TCR 镜像：${{ env.TCR_FULL_IMAGE || '(见 build-push job)' }}"
           echo "   部署目录：${{ env.ECS_DEPLOY_DIR }}（ECS 上）"
